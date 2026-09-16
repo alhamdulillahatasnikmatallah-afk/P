@@ -1,0 +1,159 @@
+name: Build WayyMusify APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        run: |
+          set -e
+          ls -la
+          if [ ! -f WayyMusify.zip ]; then
+            echo "::error::WayyMusify.zip TIDAK ditemukan di root repo. Pastikan file sudah di-commit & di-push (git add WayyMusify.zip && git commit && git push)."
+            exit 1
+          fi
+          unzip -oq WayyMusify.zip
+          ls -la
+          if [ -d WayyMusify ]; then
+            echo "PROJECT_DIR=WayyMusify" >> "$GITHUB_ENV"
+          else
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          fi
+
+      - name: Sanity check project structure
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          echo "PROJECT_DIR resolved to: $(pwd)"
+          test -f gradlew || { echo "::error::gradlew tidak ditemukan di $(pwd)"; exit 1; }
+          test -f settings.gradle.kts || { echo "::error::settings.gradle.kts tidak ditemukan"; exit 1; }
+          # IconPack adalah git submodule kosong kalau di-zip manual tanpa 'git submodule update --init'
+          # Task GenerateIconPackTask WAJIB butuh IconPack/metadata.json dan IconPack/svg/ ada.
+          mkdir -p IconPack/svg
+          if [ ! -f IconPack/metadata.json ]; then
+            echo '[]' > IconPack/metadata.json
+            echo "IconPack/metadata.json kosong, dibuat default '[]' supaya build tidak gagal."
+          fi
+          for p in core lyrics/kugou lyrics/lrclib lyrics/simpmusic lyrics/paxsenix lyrics/betterlyrics lyrics/unison lyrics/youlyplus lastfm canvas shazamkit spotifycore morideobfuscator app; do
+            if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
+              echo "OK   $p"
+            else
+              echo "::error::MISSING atau KOSONG: $p (submodule belum ter-include di zip)"
+              exit 1
+            fi
+          done
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          set -e
+          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;35.0.0" "cmdline-tools;latest"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Prepare Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          chmod +x gradlew
+          echo "org.gradle.jvmargs=-Xmx6g -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "org.gradle.daemon=false" >> gradle.properties
+
+      - name: Build FOSS Mobile Universal Nightly (no signing required)
+        id: build
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleFossMobileUniversalNightly \
+            --stacktrace --no-daemon --warning-mode all \
+            2>&1 | tee /tmp/build_log.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx6g"
+
+      - name: Fallback build (debug variant, most reliable)
+        id: fallback
+        if: steps.build.outputs.code != '0'
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          echo "Nightly build gagal, mencoba FossMobileUniversalDebug..." | tee -a /tmp/build_log.txt
+          ./gradlew :app:assembleFossMobileUniversalDebug \
+            --stacktrace --no-daemon \
+            2>&1 | tee -a /tmp/build_log.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: List available assemble tasks if all builds failed
+        if: steps.build.outputs.code != '0' && steps.fallback.outputs.code != '0'
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          echo "Semua build gagal. Menampilkan task assemble yang tersedia..." | tee -a /tmp/build_log.txt
+          ./gradlew tasks --all 2>&1 | grep -i assemble | tee -a /tmp/build_log.txt || true
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p /tmp/debug_out /tmp/apk_out
+          cp /tmp/build_log.txt /tmp/debug_out/ 2>/dev/null || echo "no log" > /tmp/debug_out/build_log.txt
+          {
+            echo "=== Java ==="; java -version 2>&1
+            echo "=== PROJECT_DIR ==="; echo "$PROJECT_DIR"
+            echo "=== Modules ==="
+            ls -la "$PROJECT_DIR" | head -40
+            echo "=== Looking for APKs ==="
+            find "$PROJECT_DIR" -name "*.apk" -type f 2>/dev/null
+          } | tee /tmp/debug_out/env_info.txt
+          find "$PROJECT_DIR" -name "*.apk" -type f -exec cp {} /tmp/apk_out/ \; 2>/dev/null || true
+          ls -lah /tmp/apk_out/ || true
+          cd /tmp && zip -r debug_package.zip debug_out
+          if ls /tmp/apk_out/*.apk 1>/dev/null 2>&1; then
+            cd /tmp/apk_out && zip -r /tmp/apks.zip *.apk
+          fi
+
+      - name: Upload debug ZIP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayymusify-debug
+          path: /tmp/debug_package.zip
+          retention-days: 14
+
+      - name: Upload APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayymusify-apks
+          path: /tmp/apk_out/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail if no APK
+        if: always()
+        run: |
+          if ls /tmp/apk_out/*.apk 1>/dev/null 2>&1; then
+            echo "APK build success"
+            exit 0
+          else
+            echo "No APK produced. Download wayymusify-debug and check build_log.txt"
+            exit 1
+          fi
